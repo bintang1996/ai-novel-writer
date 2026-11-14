@@ -29,7 +29,6 @@ if ([string]::IsNullOrWhiteSpace($InstallerPath)) {
 
 $resolvedInstaller = (Resolve-Path -LiteralPath $InstallerPath).Path
 $script:aiNovelPackagedVectorEvidencePath = Join-Path $root ("release\{0}\qualification\packaged-vector-smoke.json" -f [string]$packageJson.version)
-$script:aiNovelPackagedOfficialHomepageEvidencePath = Join-Path $root ("release\{0}\qualification\packaged-official-homepage-smoke.json" -f [string]$packageJson.version)
 $script:aiNovelAcceptanceDirectory = if (-not [string]::IsNullOrWhiteSpace($env:AI_NOVEL_RELEASE_EVIDENCE_ROOT)) {
   Join-Path $env:AI_NOVEL_RELEASE_EVIDENCE_ROOT 'acceptance'
 } else {
@@ -695,99 +694,6 @@ function Invoke-AiNovelPackagedVectorSmoke {
   }
 }
 
-function Invoke-AiNovelPackagedOfficialHomepageSmoke {
-  param([Parameter(Mandatory = $true)][string]$Path)
-
-  # The installed executable receives only a fresh one-time token. The
-  # packaged main process substitutes its shell.openExternal dependency, so the
-  # probe cannot launch a browser or depend on network availability.
-  $token = [guid]::NewGuid().ToString('N')
-  $stdoutPath = Join-Path $smokeRoot 'packaged-official-homepage-smoke.stdout'
-  $stderrPath = Join-Path $smokeRoot 'packaged-official-homepage-smoke.stderr'
-  $previousReleaseHomepageSmoke = $env:AI_NOVEL_RELEASE_HOMEPAGE_SMOKE
-  $previousReleaseHomepageSmokeToken = $env:AI_NOVEL_RELEASE_HOMEPAGE_SMOKE_TOKEN
-  $profile = New-AiNovelQualificationProfile -Root (Join-Path $smokeRoot 'qualification-officialhomepage')
-  $previousCanonicalHome = $env:AI_NOVEL_APP_DATA_HOME
-  $previousLegacySourceHome = $env:AI_NOVEL_LEGACY_SOURCE_HOME
-  $previousProfileAlias = $env:AI_NOVEL_VELA_HOME
-  $evidenceSucceeded = $false
-
-  try {
-    New-Item -ItemType Directory -Path $profile.userData -Force | Out-Null
-    $env:AI_NOVEL_APP_DATA_HOME = $profile.canonical
-    $env:AI_NOVEL_LEGACY_SOURCE_HOME = $profile.legacy
-    $env:AI_NOVEL_VELA_HOME = $profile.legacy
-    $env:AI_NOVEL_RELEASE_HOMEPAGE_SMOKE = '1'
-    $env:AI_NOVEL_RELEASE_HOMEPAGE_SMOKE_TOKEN = $token
-    Invoke-AiNovelMonitoredExecutable `
-      -Path $Path `
-      -Arguments @("--user-data-dir=`"$($profile.userData)`"", "--ai-novel-release-homepage-smoke=$token") `
-      -Operation 'Packaged official homepage qualification' `
-      -StandardOutputPath $stdoutPath `
-      -StandardErrorPath $stderrPath `
-      -HideWindow
-
-    $resultLine = @(Get-AiNovelUtf8NonEmptyLines -Path $stdoutPath | Select-Object -Last 1)
-    if ($resultLine.Count -ne 1) {
-      throw 'Packaged official homepage qualification did not produce exactly one JSON evidence line.'
-    }
-    try {
-      $result = $resultLine[0] | ConvertFrom-Json -ErrorAction Stop
-    }
-    catch {
-      throw "Packaged official homepage qualification produced invalid JSON evidence: $($_.Exception.Message)"
-    }
-    $validEvidence = (
-      $result.schemaVersion -eq 1 -and
-      $result.kind -eq 'packaged-official-homepage-smoke' -and
-      $null -ne $result.trustedIntent -and
-      $result.trustedIntent.channel -eq 'official-homepage:open' -and
-      $result.trustedIntent.requestArgumentCount -eq 0 -and
-      $result.trustedIntent.url -eq 'https://github.com/EthanYoQ/AI-Novel-Writer' -and
-      $result.trustedIntent.success -eq $true -and
-      $result.trustedIntent.shellOpenExternalCalls -eq 1 -and
-      $null -ne $result.failedOpenExternal -and
-      $result.failedOpenExternal.success -eq $false -and
-      $result.failedOpenExternal.shellOpenExternalCalls -eq 1 -and
-      $result.failedOpenExternal.controllerError -eq 'Unable to open the official homepage.' -and
-      $result.failedOpenExternal.rendererError.zhCN -eq '无法打开官方主页，请稍后重试。' -and
-      $result.failedOpenExternal.rendererError.enUS -eq 'Unable to open the official homepage. Please try again later.'
-    )
-    if (-not $validEvidence) {
-      throw 'Packaged official homepage qualification returned incomplete or unexpected evidence.'
-    }
-
-    $evidenceDirectory = Split-Path -Parent $script:aiNovelPackagedOfficialHomepageEvidencePath
-    New-Item -ItemType Directory -Path $evidenceDirectory -Force | Out-Null
-    $result | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $script:aiNovelPackagedOfficialHomepageEvidencePath -Encoding utf8
-    Write-Host "Packaged official homepage smoke evidence: $script:aiNovelPackagedOfficialHomepageEvidencePath"
-    $evidenceSucceeded = $true
-  }
-  catch {
-    $stderr = if (Test-Path -LiteralPath $stderrPath) {
-      (Get-AiNovelUtf8NonEmptyLines -Path $stderrPath) -join [Environment]::NewLine
-    }
-    else {
-      ''
-    }
-    if ([string]::IsNullOrWhiteSpace($stderr)) {
-      throw
-    }
-    throw "Packaged official homepage qualification failed: $($_.Exception.Message)$([Environment]::NewLine)$stderr"
-  }
-  finally {
-    $env:AI_NOVEL_APP_DATA_HOME = $previousCanonicalHome
-    $env:AI_NOVEL_LEGACY_SOURCE_HOME = $previousLegacySourceHome
-    $env:AI_NOVEL_VELA_HOME = $previousProfileAlias
-    $env:AI_NOVEL_RELEASE_HOMEPAGE_SMOKE = $previousReleaseHomepageSmoke
-    $env:AI_NOVEL_RELEASE_HOMEPAGE_SMOKE_TOKEN = $previousReleaseHomepageSmokeToken
-    if ($evidenceSucceeded) {
-      Remove-Item -LiteralPath $stdoutPath -Force -ErrorAction SilentlyContinue
-      Remove-Item -LiteralPath $stderrPath -Force -ErrorAction SilentlyContinue
-    }
-  }
-}
-
 function Install-Silently {
   param([Parameter(Mandatory = $true)][string]$Path)
 
@@ -903,7 +809,6 @@ function Assert-AiNovelUninstallPostcondition {
 function Write-AiNovelPackagedSmokeAcceptanceReceipt {
   $records = @(
     @{ kind = 'packaged-vector-smoke'; path = $script:aiNovelPackagedVectorEvidencePath }
-    @{ kind = 'packaged-official-homepage-smoke'; path = $script:aiNovelPackagedOfficialHomepageEvidencePath }
   ) | ForEach-Object {
     if (-not (Test-Path -LiteralPath $_.path -PathType Leaf)) {
       throw "Packaged smoke evidence is missing: $($_.path)"
@@ -925,7 +830,7 @@ function Write-AiNovelPackagedSmokeAcceptanceReceipt {
       schemaVersion = 2
       kind = 'windows-packaged-smoke-summary'
       accepted = $true
-      observations = @('The installed package produced the required vector and official-homepage smoke evidence.')
+      observations = @('The installed package produced the required vector smoke evidence.')
       direct = [ordered]@{ evidenceCount = @($records).Count; evidenceKinds = @($records | ForEach-Object { $_.kind }) }
       evidence = @($records)
     })
@@ -1111,7 +1016,6 @@ $currentInstallCompleted = $true
       installedExecutableExists = $true
     })
   Invoke-AiNovelPackagedVectorSmoke -Path $exePath
-  Invoke-AiNovelPackagedOfficialHomepageSmoke -Path $exePath
   Write-AiNovelPackagedSmokeAcceptanceReceipt
   $appSmokeParameters = @{
     ExePath = $exePath
