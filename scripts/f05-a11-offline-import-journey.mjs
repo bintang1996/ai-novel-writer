@@ -954,7 +954,9 @@ tables={'project_core':['id','project_name','characters_arch','core_outline','wo
  'finalization_outbox':['finalization_id','draft_id','content_hash','content_snapshot']}
 rows={}
 for table,columns in tables.items():
-  query='select '+','.join(columns)+' from '+table+' order by rowid'
+  # 目标库（1.5.0+）里 drafts 已是回收站视图（m07），视图没有 rowid；统一按所选列排序，
+  # 对表与视图都成立，且两侧排序规则一致，逐行相等性断言保持确定性。
+  query='select '+','.join(columns)+' from '+table+' order by '+','.join(columns)
   source=list(a.execute(query)); target=list(b.execute(query))
   assert source==target,(table,source,target)
   rows[table]=len(source)
