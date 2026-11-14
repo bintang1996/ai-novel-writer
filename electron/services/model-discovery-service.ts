@@ -1,0 +1,413 @@
+import type {
+  DiscoveredModel,
+  LocalContextWindowRequest,
+  ModelDiscoveryRequest,
+  ModelDiscoveryResult,
+} from '../../src/shared/ipc-channels'
+import { isLocalModelEndpoint } from '../../src/shared/provider-presets'
+
+interface ModelDiscoveryServiceDependencies {
+  fetchImpl?: typeof fetch
+  timeoutMs?: number
+}
+
+type DiscoveryPurpose = 'generation' | 'embedding'
+
+const DEFAULT_MODEL_DISCOVERY_TIMEOUT_MS = 15_000
+const MAX_DISCOVERED_MODEL_ENTRIES = 500
+const MAX_DISCOVERED_MODEL_TEXT_BYTES = 512
+
+function containsControlCharacter(value: string): boolean {
+  for (const character of value) {
+    const codePoint = character.codePointAt(0)
+    if (codePoint !== undefined && (codePoint <= 0x1f || (codePoint >= 0x7f && codePoint <= 0x9f))) {
+      return true
+    }
+  }
+  return false
+}
+
+function resolveOpenAIModelsUrl(baseUrl: string): string {
+  const endpoint = new URL(baseUrl.trim())
+  let configuredPath = endpoint.pathname.replace(/\/+$/u, '')
+
+  if (configuredPath.endsWith('/chat/completions')) {
+    configuredPath = configuredPath.slice(0, -'/chat/completions'.length)
+  } else if (configuredPath.endsWith('/chat')) {
+    configuredPath = configuredPath.slice(0, -'/chat'.length)
+  }
+  if (!configuredPath) configuredPath = '/v1'
+
+  endpoint.pathname = `${configuredPath}/models`
+  endpoint.search = ''
+  endpoint.hash = ''
+  endpoint.username = ''
+  endpoint.password = ''
+  return endpoint.toString()
+}
+
+function resolveGeminiModelsUrl(baseUrl: string): string {
+  const endpoint = new URL(baseUrl.trim())
+  const configuredPath = endpoint.pathname.replace(/\/+$/u, '')
+
+  if (configuredPath.endsWith('/v1beta/models')) {
+    endpoint.pathname = configuredPath
+  } else if (configuredPath.endsWith('/v1beta')) {
+    endpoint.pathname = `${configuredPath}/models`
+  } else {
+    endpoint.pathname = `${configuredPath}/v1beta/models`
+  }
+  endpoint.search = ''
+  endpoint.hash = ''
+  endpoint.username = ''
+  endpoint.password = ''
+  return endpoint.toString()
+}
+
+/** Anthropic Models API：GET {base}/v1/models，默认每页 20 条，显式放宽到接口上限。 */
+function resolveAnthropicModelsUrl(baseUrl: string): string {
+  const endpoint = new URL(baseUrl.trim())
+  let configuredPath = endpoint.pathname.replace(/\/+$/u, '')
+
+  if (configuredPath.endsWith('/v1/messages')) {
+    configuredPath = configuredPath.slice(0, -'/messages'.length)
+  } else if (configuredPath.endsWith('/messages')) {
+    configuredPath = configuredPath.slice(0, -'/messages'.length)
+  }
+  if (!configuredPath.endsWith('/v1')) configuredPath = `${configuredPath}/v1`
+  endpoint.pathname = `${configuredPath}/models`
+  endpoint.search = 'limit=1000'
+  endpoint.hash = ''
+  endpoint.username = ''
+  endpoint.password = ''
+  return endpoint.toString()
+}
+
+function resolveNativeUrl(baseUrl: string, nativePath: string): string {
+  const endpoint = new URL(resolveOpenAIModelsUrl(baseUrl))
+  endpoint.pathname = `${endpoint.pathname.replace(/(?:\/v1)?\/models$/u, '')}${nativePath}`
+  return endpoint.toString()
+}
+
+function windowTokens(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined
+}
+
+function declaredWindow(value: unknown): Pick<DiscoveredModel, 'capabilities'> {
+  const contextWindowTokens = windowTokens(value)
+  return contextWindowTokens === undefined ? {} : { capabilities: { contextWindowTokens } }
+}
+
+function records(value: unknown): Record<string, unknown>[] {
+  return Array.isArray(value) ? value.filter((item): item is Record<string, unknown> => !!item && typeof item === 'object') : []
+}
+
+const withoutLatestTag = (name: unknown) => typeof name === 'string' ? name.replace(/:latest$/u, '') : name
+
+function ollamaRunningWindow(payload: Record<string, unknown>, modelName: string): number | undefined {
+  const wanted = withoutLatestTag(modelName)
+  const running = records(payload.models).find(item => withoutLatestTag(item.name) === wanted || withoutLatestTag(item.model) === wanted)
+  return windowTokens(running?.context_length)
+}
+
+/** 只认 Modelfile 设过的 num_ctx。model_info 里的 context_length 是模型架构上限，不是实际运行值。 */
+function ollamaConfiguredWindow(payload: Record<string, unknown>): number | undefined {
+  const match = typeof payload.parameters === 'string' ? /^\s*num_ctx\s+(\d+)\s*$/mu.exec(payload.parameters) : null
+  return match ? windowTokens(Number(match[1])) : undefined
+}
+
+/** 只认已加载实例的运行值。max_context_length 是模型上限，未加载时实际窗口未知。 */
+function lmStudioLoadedWindow(payload: Record<string, unknown>, modelName: string): number | undefined {
+  for (const model of records(payload.models)) {
+    const instances = records(model.loaded_instances)
+    const instance = instances.find(item => item.id === modelName) ?? (model.key === modelName ? instances[0] : undefined)
+    if (instance) return windowTokens((instance.config as { context_length?: unknown } | undefined)?.context_length)
+  }
+  return undefined
+}
+
+function safeProviderText(value: unknown, credential: string): string | null {
+  if (typeof value !== 'string') return null
+  if (Buffer.byteLength(value, 'utf8') > MAX_DISCOVERED_MODEL_TEXT_BYTES) return null
+  if (containsControlCharacter(value)) return null
+  const normalized = value.trim()
+  if (!normalized || urlContainsCredential(normalized, credential)) return null
+  return normalized
+}
+
+function urlContainsCredential(url: string, credential: string): boolean {
+  if (!credential) return false
+  if (url.includes(credential) || url.includes(encodeURIComponent(credential))) return true
+  try {
+    return decodeURIComponent(url).includes(credential)
+  } catch {
+    return false
+  }
+}
+
+function classifyHttpFailure(status: number): ModelDiscoveryResult {
+  if (status === 401 || status === 403) {
+    return { success: false, errorCode: 'auth' }
+  }
+  if (status === 408 || status === 425 || status === 429 || status >= 500) {
+    return { success: false, errorCode: 'network' }
+  }
+  return { success: false, errorCode: 'unsupported' }
+}
+
+function parseOpenAIModels(payload: unknown, credential: string): DiscoveredModel[] | null {
+  if (!payload || typeof payload !== 'object' || !Array.isArray((payload as { data?: unknown }).data)) {
+    return null
+  }
+
+  const entries = (payload as { data: unknown[] }).data
+  if (entries.length > MAX_DISCOVERED_MODEL_ENTRIES) return null
+  const models: DiscoveredModel[] = []
+  const seenValues = new Set<string>()
+  for (const item of entries) {
+    if (!item || typeof item !== 'object') return null
+    const id = safeProviderText((item as { id?: unknown }).id, credential)
+    if (!id) return null
+    const providerName = (item as { name?: unknown }).name
+    const name = providerName === undefined ? id : safeProviderText(providerName, credential)
+    if (!name) return null
+    if (seenValues.has(id)) continue
+    seenValues.add(id)
+    const raw = item as Record<string, unknown>
+    const flags = raw.capabilities && typeof raw.capabilities === 'object'
+      ? raw.capabilities as Record<string, unknown> : {}
+    const capabilities: NonNullable<DiscoveredModel['capabilities']> = {}
+    const context = windowTokens(raw.context_window ?? raw.context_length)
+    if (context !== undefined) capabilities.contextWindowTokens = context
+    const output = raw.max_output_tokens
+    if (typeof output === 'number' && Number.isSafeInteger(output) && output > 0) capabilities.maxOutputTokens = output
+    for (const key of ['reasoning', 'structuredOutput', 'usage'] as const) {
+      if (typeof flags[key] === 'boolean') capabilities[key] = flags[key]
+    }
+    models.push({ id, name, value: id, ...(Object.keys(capabilities).length ? { capabilities } : {}) })
+  }
+  return models
+}
+
+/**
+ * TTS、图像（Nano Banana）、转写、音乐（Lyria）、音频模型，以及电脑操作、深度研究、Antigravity 与机器人这类代理模型，
+ * 在 models 接口里同样声明 generateContent，只能按 Google 的命名区分；它们不是用来写正文的。
+ */
+const GEMINI_NON_WRITING_MODEL = /(?:^|[-_.])(?:tts|image|live|transcribe|audio|lyria|nano-banana|computer-use|deep-research|antigravity|robotics)(?:$|[-_.])/iu
+const OPENAI_COMPATIBLE_EMBEDDING_MODEL = /embed|bge/iu
+
+function geminiModelServesPurpose(item: object, value: string, purpose: DiscoveryPurpose): boolean {
+  const methods = (item as { supportedGenerationMethods?: unknown }).supportedGenerationMethods
+  // 自建网关可能不返回方法字段，这时无法判断用途，保留给作者自己选。
+  if (Array.isArray(methods) && !methods.includes(purpose === 'embedding' ? 'embedContent' : 'generateContent')) return false
+  return purpose === 'embedding' || !GEMINI_NON_WRITING_MODEL.test(value)
+}
+
+/** listed 是端点列出的模型数，用来区分「端点没有模型」和「没有适合当前用途的模型」。 */
+function parseGeminiModels(payload: unknown, credential: string, purpose: DiscoveryPurpose): { models: DiscoveredModel[], listed: number } | null {
+  if (!payload || typeof payload !== 'object' || !Array.isArray((payload as { models?: unknown }).models)) {
+    return null
+  }
+
+  const entries = (payload as { models: unknown[] }).models
+  if (entries.length > MAX_DISCOVERED_MODEL_ENTRIES) return null
+  const models: DiscoveredModel[] = []
+  const seenValues = new Set<string>()
+  for (const item of entries) {
+    if (!item || typeof item !== 'object') return null
+    const id = safeProviderText((item as { name?: unknown }).name, credential)
+    if (!id) return null
+    const providerName = (item as { displayName?: unknown }).displayName
+    const name = providerName === undefined ? id : safeProviderText(providerName, credential)
+    if (!name) return null
+    const value = id.startsWith('models/') ? id.slice('models/'.length) : id
+    if (!value) return null
+    if (seenValues.has(value)) continue
+    seenValues.add(value)
+    if (geminiModelServesPurpose(item, value, purpose)) models.push({ id, name, value, ...declaredWindow((item as { inputTokenLimit?: unknown }).inputTokenLimit) })
+  }
+  return { models, listed: seenValues.size }
+}
+
+/** Anthropic Models 的返回形如 {data: [{id, display_name}]}；只认声明过的文本字段。 */
+function parseAnthropicModels(payload: unknown, credential: string): { models: DiscoveredModel[], listed: number } | null {
+  if (!payload || typeof payload !== 'object' || !Array.isArray((payload as { data?: unknown }).data)) {
+    return null
+  }
+
+  const entries = (payload as { data: unknown[] }).data
+  if (entries.length > MAX_DISCOVERED_MODEL_ENTRIES) return null
+  const models: DiscoveredModel[] = []
+  const seenValues = new Set<string>()
+  for (const item of entries) {
+    if (!item || typeof item !== 'object') return null
+    const id = safeProviderText((item as { id?: unknown }).id, credential)
+    if (!id) return null
+    const providerName = (item as { display_name?: unknown }).display_name
+    const name = providerName === undefined ? id : safeProviderText(providerName, credential)
+    if (!name) return null
+    if (seenValues.has(id)) continue
+    seenValues.add(id)
+    models.push({ id, name, value: id, ...declaredWindow((item as { max_input_tokens?: unknown }).max_input_tokens) })
+  }
+  return { models, listed: seenValues.size }
+}
+
+/**
+ * Main-process model discovery boundary. The current form reaches this trusted
+ * boundary without being saved, and provider details are reduced to a fixed result.
+ */
+export class ModelDiscoveryService {
+  constructor(private readonly dependencies: ModelDiscoveryServiceDependencies = {}) {}
+
+  /** 读失败有意不外抛、不弹错，由 resolveContextWindow 兜底。 */
+  async discoverLocalContextWindow(model: LocalContextWindowRequest): Promise<number | null> {
+    if (model.protocol !== 'openai' || !isLocalModelEndpoint(model)) return null
+    const abortController = new AbortController()
+    const timeout = setTimeout(() => abortController.abort(), this.dependencies.timeoutMs ?? DEFAULT_MODEL_DISCOVERY_TIMEOUT_MS)
+    const requestJson = async (nativePath: string, body?: unknown): Promise<Record<string, unknown>> => {
+      const response = await (this.dependencies.fetchImpl ?? fetch)(resolveNativeUrl(model.baseUrl, nativePath), {
+        method: body === undefined ? 'GET' : 'POST',
+        redirect: 'error',
+        signal: abortController.signal,
+        headers: { Accept: 'application/json', ...(model.apiKey ? { Authorization: `Bearer ${model.apiKey}` } : {}) },
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      })
+      const payload: unknown = response.ok ? await response.json() : null
+      return payload && typeof payload === 'object' ? payload as Record<string, unknown> : {}
+    }
+    try {
+      if (model.provider !== 'ollama') return lmStudioLoadedWindow(await requestJson('/api/v1/models'), model.modelName) ?? null
+      return ollamaRunningWindow(await requestJson('/api/ps'), model.modelName)
+        ?? ollamaConfiguredWindow(await requestJson('/api/show', { model: model.modelName })) ?? null
+    } catch {
+      return null
+    } finally {
+      clearTimeout(timeout)
+    }
+  }
+
+  async discoverModels(model: ModelDiscoveryRequest): Promise<ModelDiscoveryResult> {
+    const purpose: DiscoveryPurpose = Array.isArray(model.purposes) && model.purposes.includes('embedding') ? 'embedding' : 'generation'
+    const configuredTimeoutMs = this.dependencies.timeoutMs ?? DEFAULT_MODEL_DISCOVERY_TIMEOUT_MS
+    const timeoutMs = Number.isFinite(configuredTimeoutMs) && configuredTimeoutMs > 0
+      ? configuredTimeoutMs
+      : DEFAULT_MODEL_DISCOVERY_TIMEOUT_MS
+    const abortController = new AbortController()
+    const timeout = setTimeout(() => abortController.abort(), timeoutMs)
+
+    try {
+      if (model.protocol === 'anthropic') {
+        const requestUrl = resolveAnthropicModelsUrl(model.baseUrl)
+        if (urlContainsCredential(requestUrl, model.apiKey)) {
+          return { success: false, errorCode: 'invalid_response' }
+        }
+        const response = await (this.dependencies.fetchImpl ?? fetch)(
+          requestUrl,
+          {
+            method: 'GET',
+            redirect: 'error',
+            signal: abortController.signal,
+            headers: {
+              Accept: 'application/json',
+              // 与 AnthropicProvider 的生成请求同一套鉴权，只认 Bearer 的网关也能拉到列表。
+              'x-api-key': model.apiKey,
+              Authorization: `Bearer ${model.apiKey}`,
+              'anthropic-version': '2023-06-01',
+            },
+          },
+        )
+        if (!response.ok) return classifyHttpFailure(response.status)
+
+        let payload: unknown
+        try {
+          payload = await response.json()
+        } catch {
+          return abortController.signal.aborted
+            ? { success: false, errorCode: 'network' }
+            : { success: false, errorCode: 'invalid_response' }
+        }
+        const parsed = parseAnthropicModels(payload, model.apiKey)
+        if (!parsed) return { success: false, errorCode: 'invalid_response' }
+        if (parsed.listed === 0) return { success: false, errorCode: 'no_models' }
+        // Anthropic Messages 协议没有嵌入端点；列出的都是对话模型。
+        if (purpose === 'embedding') return { success: false, errorCode: 'no_suitable_models' }
+        return { success: true, models: parsed.models }
+      }
+
+      if (model.protocol === 'gemini') {
+        const requestUrl = resolveGeminiModelsUrl(model.baseUrl)
+        if (urlContainsCredential(requestUrl, model.apiKey)) {
+          return { success: false, errorCode: 'invalid_response' }
+        }
+        const response = await (this.dependencies.fetchImpl ?? fetch)(
+          requestUrl,
+          {
+            method: 'GET',
+            redirect: 'error',
+            signal: abortController.signal,
+            headers: {
+              Accept: 'application/json',
+              'x-goog-api-key': model.apiKey,
+            },
+          },
+        )
+        if (!response.ok) return classifyHttpFailure(response.status)
+
+        let payload: unknown
+        try {
+          payload = await response.json()
+        } catch {
+          return abortController.signal.aborted
+            ? { success: false, errorCode: 'network' }
+            : { success: false, errorCode: 'invalid_response' }
+        }
+        const parsed = parseGeminiModels(payload, model.apiKey, purpose)
+        if (!parsed) return { success: false, errorCode: 'invalid_response' }
+        if (parsed.listed === 0) return { success: false, errorCode: 'no_models' }
+        if (parsed.models.length === 0) return { success: false, errorCode: 'no_suitable_models' }
+        return { success: true, models: parsed.models }
+      }
+
+      const requestUrl = resolveOpenAIModelsUrl(model.baseUrl)
+      if (urlContainsCredential(requestUrl, model.apiKey)) {
+        return { success: false, errorCode: 'invalid_response' }
+      }
+      const response = await (this.dependencies.fetchImpl ?? fetch)(
+        requestUrl,
+        {
+          method: 'GET',
+          redirect: 'error',
+          signal: abortController.signal,
+          headers: {
+            Accept: 'application/json',
+            Authorization: `Bearer ${model.apiKey}`,
+          },
+        },
+      )
+      if (!response.ok) return classifyHttpFailure(response.status)
+
+      let payload: unknown
+      try {
+        payload = await response.json()
+      } catch {
+        return abortController.signal.aborted
+          ? { success: false, errorCode: 'network' }
+          : { success: false, errorCode: 'invalid_response' }
+      }
+      const models = parseOpenAIModels(payload, model.apiKey)
+      if (!models) return { success: false, errorCode: 'invalid_response' }
+      if (models.length === 0) return { success: false, errorCode: 'no_models' }
+      // OpenAI 兼容接口不说明模型用途，只能按名字认出向量模型。
+      if (purpose === 'embedding') {
+        const isEmbedding = (candidate: DiscoveredModel) => OPENAI_COMPATIBLE_EMBEDDING_MODEL.test(candidate.value)
+        return { success: true, models: [...models.filter(isEmbedding), ...models.filter(candidate => !isEmbedding(candidate))] }
+      }
+      return { success: true, models }
+    } catch {
+      return { success: false, errorCode: 'network' }
+    } finally {
+      clearTimeout(timeout)
+    }
+  }
+}

@@ -1,0 +1,234 @@
+import { getProjectDb } from '../database'
+import { parseChapterGoalReview, type ChapterGoalReview } from '../../src/shared/chapter-goal-review'
+import {
+  narrativeThreadReviewCandidates,
+  type NarrativeThreadReviewCandidate,
+  type ReviewedFinalDraft,
+} from '../../src/shared/narrative-thread-review-candidates'
+import {
+  compareNarrativeThreadSchedules,
+  NARRATIVE_EVENT_EVIDENCE_MAX_LENGTH,
+  NARRATIVE_EVENT_REASON_MAX_LENGTH,
+  narrativeEvidenceInText,
+  narrativeThreadSchedule,
+  narrativeThreadView,
+  type NarrativeThreadEvent,
+  type NarrativeThreadEventInput,
+  type NarrativeThreadChapterContext,
+  type NarrativeThreadPlanInput,
+  type NarrativeThreadPlanRecord,
+  type NarrativeThreadView,
+} from '../../src/shared/narrative-thread'
+
+function requireDb() {
+  const db = getProjectDb()
+  if (!db) throw new Error('PROJECT_NOT_OPEN')
+  return db
+}
+
+function validatePlan(input: NarrativeThreadPlanInput): NarrativeThreadPlanInput {
+  const title = input.title.trim()
+  const type = input.type.trim()
+  const authorIntent = input.authorIntent.trim()
+  if (!title || title.length > 120 || !type || type.length > 60
+    || !authorIntent || authorIntent.length > 1000) {
+    throw new Error('NARRATIVE_THREAD_PLAN_INVALID')
+  }
+  if (!Number.isSafeInteger(input.targetStartChapter) || input.targetStartChapter < 1
+    || !Number.isSafeInteger(input.targetEndChapter) || input.targetEndChapter < input.targetStartChapter) {
+    throw new Error('NARRATIVE_THREAD_RANGE_INVALID')
+  }
+  return { ...input, title, type, authorIntent }
+}
+
+function savedGoalReview(reportBody: string): ChapterGoalReview | null {
+  try {
+    return parseChapterGoalReview((JSON.parse(reportBody) as { goalReview?: unknown } | null)?.goalReview)
+  } catch {
+    return null
+  }
+}
+
+function rowToPlan(row: Record<string, unknown>): NarrativeThreadPlanRecord {
+  return {
+    id: row.id as number,
+    title: row.title as string,
+    type: row.type as string,
+    targetStartChapter: row.target_start_chapter as number,
+    targetEndChapter: row.target_end_chapter as number,
+    authorIntent: row.author_intent as string,
+    createdAt: row.created_at as string,
+    updatedAt: row.updated_at as string,
+  }
+}
+
+export class NarrativeThreadRepository {
+  static createPlan(input: NarrativeThreadPlanInput, db = requireDb()): NarrativeThreadPlanRecord {
+    const value = validatePlan(input)
+    const result = db.prepare(`
+      INSERT INTO narrative_thread_plans (
+        title, type, target_start_chapter, target_end_chapter, author_intent
+      ) VALUES (?, ?, ?, ?, ?)
+    `).run(value.title, value.type, value.targetStartChapter, value.targetEndChapter, value.authorIntent)
+    return this.getPlan(Number(result.lastInsertRowid), db)!
+  }
+
+  static updatePlan(id: number, input: NarrativeThreadPlanInput, db = requireDb()): NarrativeThreadPlanRecord {
+    const value = validatePlan(input)
+    const result = db.prepare(`
+      UPDATE narrative_thread_plans
+      SET title = ?, type = ?, target_start_chapter = ?, target_end_chapter = ?,
+          author_intent = ?, updated_at = datetime('now')
+      WHERE id = ?
+    `).run(value.title, value.type, value.targetStartChapter, value.targetEndChapter, value.authorIntent, id)
+    if (result.changes !== 1) throw new Error('NARRATIVE_THREAD_PLAN_NOT_FOUND')
+    return this.getPlan(id, db)!
+  }
+
+  static deletePlan(id: number, db = requireDb()): void {
+    const result = db.prepare('DELETE FROM narrative_thread_plans WHERE id = ?').run(id)
+    if (result.changes !== 1) throw new Error('NARRATIVE_THREAD_PLAN_NOT_FOUND')
+  }
+
+  static getPlan(id: number, db = requireDb()): NarrativeThreadPlanRecord | null {
+    const row = db.prepare('SELECT * FROM narrative_thread_plans WHERE id = ?')
+      .get(id) as Record<string, unknown> | undefined
+    return row ? rowToPlan(row) : null
+  }
+
+  static confirmEvent(input: NarrativeThreadEventInput, db = requireDb()): NarrativeThreadEvent {
+    const evidence = input.evidence.trim()
+    const reason = input.reason.trim()
+    if (!['planted', 'progressing', 'resolved', 'abandoned'].includes(input.type)
+      || !evidence || evidence.length > NARRATIVE_EVENT_EVIDENCE_MAX_LENGTH
+      || !reason || reason.length > NARRATIVE_EVENT_REASON_MAX_LENGTH) {
+      throw new Error('NARRATIVE_THREAD_EVENT_INVALID')
+    }
+    const source = db.prepare(`
+      SELECT drafts.id AS draft_id, drafts.chapter_number,
+             COALESCE(finalization_outbox.chapter_title, '') AS chapter_title,
+             finalization_outbox.content_snapshot
+      FROM drafts
+      JOIN finalization_outbox ON finalization_outbox.draft_id = drafts.id
+      WHERE drafts.id = ? AND drafts.status = 'finalized'
+    `).get(input.draftId) as { draft_id: number; chapter_number: number; chapter_title: string; content_snapshot: string } | undefined
+    if (!source) throw new Error('NARRATIVE_THREAD_EVENT_SOURCE_NOT_FINALIZED')
+    if (!narrativeEvidenceInText(evidence, source.content_snapshot)) {
+      throw new Error('NARRATIVE_THREAD_EVIDENCE_NOT_IN_SOURCE')
+    }
+    if (!this.getPlan(input.planId, db)) throw new Error('NARRATIVE_THREAD_PLAN_NOT_FOUND')
+    const result = db.prepare(`
+      INSERT INTO narrative_thread_confirmations_all (
+        plan_id, draft_id, event_type, evidence, reason
+      ) VALUES (?, ?, ?, ?, ?)
+    `).run(input.planId, input.draftId, input.type, evidence, reason)
+    const created = db.prepare('SELECT created_at AS createdAt FROM narrative_thread_confirmations WHERE id = ?')
+      .get(result.lastInsertRowid) as { createdAt: string }
+    return {
+      id: Number(result.lastInsertRowid),
+      ...input,
+      evidence,
+      reason,
+      chapterNumber: source.chapter_number,
+      chapterTitle: source.chapter_title,
+      createdAt: created.createdAt,
+    }
+  }
+
+  static carryConfirmationsToReplacement(
+    replacedDraftIds: readonly number[],
+    replacement: { draftId: number; content: string },
+    db = requireDb(),
+  ): void {
+    if (replacedDraftIds.length === 0) return
+    const confirmations = db.prepare(`
+      SELECT id, evidence FROM narrative_thread_confirmations
+      WHERE draft_id IN (${replacedDraftIds.map(() => '?').join(', ')})
+      ORDER BY id ASC
+    `).all(...replacedDraftIds) as { id: number; evidence: string }[]
+    const move = db.prepare('UPDATE OR IGNORE narrative_thread_confirmations_all SET draft_id = ? WHERE id = ?')
+    for (const confirmation of confirmations) {
+      if (narrativeEvidenceInText(confirmation.evidence, replacement.content)) move.run(replacement.draftId, confirmation.id)
+    }
+  }
+
+  static confirmationsNotCarried(replacedDraftId: number, replacementContent: string, db = requireDb()): Array<{ threadTitle: string; evidence: string }> {
+    return (db.prepare(`
+      SELECT plans.title AS threadTitle, confirmations.evidence
+      FROM narrative_thread_confirmations confirmations
+      JOIN narrative_thread_plans plans ON plans.id = confirmations.plan_id
+      WHERE confirmations.draft_id = ?
+      ORDER BY confirmations.id ASC
+    `).all(replacedDraftId) as Array<{ threadTitle: string; evidence: string }>)
+      .filter(confirmation => !narrativeEvidenceInText(confirmation.evidence, replacementContent))
+  }
+
+  static list(db = requireDb()): NarrativeThreadView[] {
+    const currentFinalizedChapter = (db.prepare(`
+      SELECT COALESCE(MAX(chapter_number), 0) AS chapterNumber
+      FROM drafts WHERE status = 'finalized'
+    `).get() as { chapterNumber: number }).chapterNumber
+    const plans = db.prepare('SELECT * FROM narrative_thread_plans ORDER BY id ASC')
+      .all() as Record<string, unknown>[]
+    return plans.map((row) => {
+      const plan = rowToPlan(row)
+      const events = db.prepare(`
+        SELECT confirmations.id, confirmations.plan_id AS planId,
+               confirmations.draft_id AS draftId, confirmations.event_type AS type,
+               confirmations.evidence, confirmations.reason, confirmations.created_at AS createdAt,
+               drafts.chapter_number AS chapterNumber,
+               COALESCE(finalization_outbox.chapter_title, '') AS chapterTitle
+        FROM narrative_thread_confirmations confirmations
+        JOIN drafts ON drafts.id = confirmations.draft_id AND drafts.status = 'finalized'
+        JOIN finalization_outbox ON finalization_outbox.draft_id = drafts.id
+        WHERE confirmations.plan_id = ?
+        ORDER BY drafts.chapter_number ASC, confirmations.id ASC
+      `).all(plan.id) as NarrativeThreadEvent[]
+      return narrativeThreadView(plan, events, currentFinalizedChapter)
+    })
+  }
+
+  static listReviewCandidates(db = requireDb()): NarrativeThreadReviewCandidate[] {
+    const rows = db.prepare(`
+      SELECT drafts.id AS draftId, drafts.chapter_number AS chapterNumber,
+             finalization_outbox.content_snapshot AS content, contents.body AS reportBody
+      FROM drafts
+      JOIN finalization_outbox ON finalization_outbox.draft_id = drafts.id
+      JOIN reviews ON reviews.base_draft_id = drafts.id
+      JOIN contents ON contents.id = reviews.content_id
+      WHERE drafts.status = 'finalized'
+      ORDER BY drafts.chapter_number ASC, reviews.review_index DESC
+    `).all() as Array<Omit<ReviewedFinalDraft, 'goalReview'> & { reportBody: string }>
+    const latestByDraft = new Map<number, ReviewedFinalDraft>()
+    for (const { reportBody, ...draft } of rows) {
+      if (latestByDraft.has(draft.draftId)) continue
+      const goalReview = savedGoalReview(reportBody)
+      if (goalReview) latestByDraft.set(draft.draftId, { ...draft, goalReview })
+    }
+    return narrativeThreadReviewCandidates(this.list(db), [...latestByDraft.values()])
+  }
+
+  /** 写第 N 章参考的线索：逾期、到期、区间内的必选，区间未到的只在名字命中时选；逾期最久的排最前。 */
+  static listRelevantActive(context: NarrativeThreadChapterContext, db = requireDb()): NarrativeThreadView[] {
+    const currentText = `${context.title}\n${context.keyEvents}`
+    const characters = context.characters.map(character => character.trim()).filter(Boolean)
+    const mentioned = (thread: NarrativeThreadView) => {
+      const threadText = [
+        thread.title,
+        thread.type,
+        thread.authorIntent,
+        ...thread.events.flatMap(event => [event.evidence, event.reason]),
+      ].join('\n')
+      return characters.some(character => threadText.includes(character))
+        || (thread.title.length >= 2 && currentText.includes(thread.title))
+    }
+    return this.list(db)
+      .flatMap((thread) => {
+        const schedule = narrativeThreadSchedule(thread, context.chapterNumber)
+        if (!schedule || schedule.kind === 'terminal' || (schedule.kind === 'later' && !mentioned(thread))) return []
+        return [{ thread, schedule }]
+      })
+      .sort((left, right) => compareNarrativeThreadSchedules(left.schedule, right.schedule))
+      .map(({ thread }) => thread)
+  }
+}

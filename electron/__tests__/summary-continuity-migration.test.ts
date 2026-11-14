@@ -1,0 +1,119 @@
+import { createRequire } from 'node:module'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+
+import { closeLegacyNormalizationFixture as closeProjectDatabase, getLegacyNormalizationFixtureDb as getProjectDb, openLegacyNormalizationFixture } from '../../test/helpers/legacy-baseline-fixture'
+import { createLiveRowViews } from '../../test/helpers/live-row-views'
+
+// Historical normalization regressions use an explicit fixture handle. Production
+// rejects these unqualified old roots; canonical activation is tested separately.
+vi.mock('../database', async () => {
+  const actual = await vi.importActual<typeof import('../database')>('../database')
+  const fixture = await import('../../test/helpers/legacy-baseline-fixture')
+  return { ...actual, getProjectDb: fixture.getLegacyNormalizationFixtureDb, getCurrentProjectPath: fixture.getLegacyNormalizationFixturePath }
+})
+import { countDraftUnits } from '../../src/shared/draft-units'
+import { FinalizedDraftImportRepository } from '../repositories/finalized-draft-import-repository'
+import { SummaryRepository } from '../repositories/summary-repository'
+
+const require = createRequire(import.meta.url)
+const Database = require('better-sqlite3') as typeof import('better-sqlite3')
+const roots: string[] = []
+
+afterEach(() => {
+  closeProjectDatabase()
+  for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true })
+})
+
+describe('summary continuity migration', () => {
+  it('adds finalized continuity columns after opening a legacy character snapshot table', () => {
+    const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-novel-summary-migration-'))
+    roots.push(projectRoot)
+    const velaRoot = path.join(projectRoot, '.vela')
+    fs.mkdirSync(velaRoot, { recursive: true })
+    const legacyDb = new Database(path.join(velaRoot, 'vela.db'))
+    legacyDb.exec(`
+      CREATE TABLE summary_snapshots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chapter_number INTEGER NOT NULL,
+        character_states TEXT DEFAULT '',
+        created_at TEXT DEFAULT (datetime('now'))
+      );
+      INSERT INTO summary_snapshots (chapter_number, character_states)
+      VALUES (3, 'legacy character state');
+    `)
+    legacyDb.close()
+
+    expect(() => openLegacyNormalizationFixture(projectRoot)).not.toThrow()
+    createLiveRowViews(getProjectDb()!)
+    expect(getProjectDb()!.prepare('PRAGMA table_info(summary_snapshots)').all())
+      .toEqual(expect.arrayContaining([
+        expect.objectContaining({ name: 'draft_id' }),
+        expect.objectContaining({ name: 'chapter_notes' }),
+        expect.objectContaining({ name: 'continuity_facts' }),
+        expect.objectContaining({ name: 'character_state_candidates' }),
+        expect.objectContaining({ name: 'source_finalization_id' }),
+        expect.objectContaining({ name: 'source_content_hash' }),
+        expect.objectContaining({ name: 'projection_generation' }),
+      ]))
+    expect(getProjectDb()!.prepare(
+      "SELECT generation, stale_from_chapter FROM continuity_projection_meta WHERE id = 'main'",
+    ).get()).toEqual({ generation: 0, stale_from_chapter: null })
+    expect(getProjectDb()!.prepare(
+      'SELECT chapter_number, character_states, draft_id FROM summary_snapshots',
+    ).all()).toEqual([{ chapter_number: 3, character_states: 'legacy character state', draft_id: null }])
+  })
+
+  it('cascades a migrated finalized continuity snapshot when its draft is deleted', () => {
+    const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-novel-summary-cascade-migration-'))
+    roots.push(projectRoot)
+    const velaRoot = path.join(projectRoot, '.vela')
+    fs.mkdirSync(velaRoot, { recursive: true })
+    const legacyDb = new Database(path.join(velaRoot, 'vela.db'))
+    legacyDb.exec(`
+      CREATE TABLE summary_snapshots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chapter_number INTEGER NOT NULL,
+        character_states TEXT DEFAULT '',
+        created_at TEXT DEFAULT (datetime('now'))
+      );
+    `)
+    legacyDb.close()
+
+    openLegacyNormalizationFixture(projectRoot)
+    createLiveRowViews(getProjectDb()!)
+    const finalizedContent = 'A finalized author chapter.'
+    const receipt = FinalizedDraftImportRepository.commit(projectRoot, {
+      operationId: 'migration-cascade-finalized',
+      chapters: [{
+        chapterNumber: 1,
+        title: 'Opening',
+        content: finalizedContent,
+        wordCount: countDraftUnits(finalizedContent),
+      }],
+    })
+    const draftId = receipt.drafts[0]!.draftId
+    SummaryRepository.saveFinalizedContinuity({
+      draftId,
+      chapterNumber: 1,
+      chapterNotes: 'The opening establishes the continuity facts.',
+      projectionGeneration: 0,
+      source: {
+        draftId,
+        finalizationId: receipt.drafts[0]!.finalizationId,
+        chapterNumber: 1,
+        contentHash: receipt.drafts[0]!.contentHash,
+      },
+    })
+
+    expect(getProjectDb()!.prepare(
+      'SELECT draft_id FROM summary_snapshots WHERE draft_id = ?',
+    ).get(draftId)).toEqual({ draft_id: draftId })
+    getProjectDb()!.prepare('DELETE FROM drafts_all WHERE id = ?').run(draftId)
+    expect(getProjectDb()!.prepare(
+      'SELECT draft_id FROM summary_snapshots WHERE draft_id = ?',
+    ).get(draftId)).toBeUndefined()
+  })
+})
