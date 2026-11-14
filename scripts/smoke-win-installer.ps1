@@ -880,7 +880,28 @@ try {
   if ($hasPreviousVersion) {
     if (-not [string]::IsNullOrWhiteSpace($PreviousPortableZipPath)) {
       $portableExtractRoot = Join-Path $smokeRoot 'previous-portable'
-      Expand-Archive -LiteralPath (Resolve-Path -LiteralPath $PreviousPortableZipPath).Path -DestinationPath $portableExtractRoot -Force
+      # 不用 Expand-Archive：Windows PowerShell 5.1 的新版 Archive 模块会调 .NET Framework 里
+      # 不存在的 3 参 ExtractToDirectory 重载（spawn UNKNOWN 家族之外的另一类环境崩法），
+      # 改为手工逐条目解压，条目名按 UTF-8 旗标正确解码。
+      $portableZipResolved = (Resolve-Path -LiteralPath $PreviousPortableZipPath).Path
+      Add-Type -AssemblyName System.IO.Compression
+      Add-Type -AssemblyName System.IO.Compression.FileSystem
+      $portableArchive = [System.IO.Compression.ZipFile]::OpenRead($portableZipResolved)
+      try {
+        foreach ($entry in $portableArchive.Entries) {
+          if ([string]::IsNullOrEmpty($entry.Name)) { continue }
+          $entryTarget = Join-Path $portableExtractRoot $entry.FullName
+          $entryDirectory = Split-Path -Parent $entryTarget
+          if (-not (Test-Path -LiteralPath $entryDirectory)) {
+            New-Item -ItemType Directory -Path $entryDirectory -Force | Out-Null
+          }
+          $outputStream = [System.IO.File]::Create($entryTarget)
+          try {
+            $entryStream = $entry.Open()
+            try { $entryStream.CopyTo($outputStream) } finally { $entryStream.Dispose() }
+          } finally { $outputStream.Dispose() }
+        }
+      } finally { $portableArchive.Dispose() }
       $productExecutableNames = @(Get-AiNovelProductExecutableNames)
       $portableExecutable = Get-ChildItem -LiteralPath $portableExtractRoot -Recurse -File |
         Where-Object { $productExecutableNames -contains $_.Name } |
