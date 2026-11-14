@@ -20,7 +20,6 @@ const evidence = [
   'qualification/run-ledger.json',
   ...acceptance,
   'qualification/packaged-vector-smoke.json',
-  'qualification/packaged-official-homepage-smoke.json',
   'qualification/macos-dmg-smoke.json',
 ]
 

@@ -7,7 +7,6 @@ const scriptPath = fileURLToPath(import.meta.url)
 const MACOS_QUALIFICATION_ENTITIES = new Set(['macos-arm64', 'macos-x64'])
 const packagedMacosEvidence = [
   'qualification/packaged-vector-smoke.json',
-  'qualification/packaged-official-homepage-smoke.json',
   'qualification/macos-dmg-smoke.json',
 ]
 

@@ -51,9 +51,8 @@ function validWindowsReceipt(name: string, releaseRoot: string) {
     uninstall: { ...base, kind: 'windows-uninstall', direct: { installedExecutableExists: false, installDirectoryState: 'absent', allowedSystemResiduals: [] } },
     'upgrade-data': { ...base, kind: 'windows-upgrade-data', direct: { previousVersion: '0.2.5', legacyTableCount: 11, preservedAssetCount: 1, vectorDimension: 768, queryResultCount: 1, ...windowsV025CopyProof() } },
     'native-abi': { ...base, kind: 'windows-native-abi', direct: { bindingInterface: 'node-api', napiVersion: '10', nodeModuleAbi: '127', packagedLoadStep: 'verify:win-package' } },
-    'packaged-smoke': { ...base, kind: 'windows-packaged-smoke-summary', direct: { evidenceCount: 2, evidenceKinds: ['packaged-vector-smoke', 'packaged-official-homepage-smoke'] }, evidence: [
+    'packaged-smoke': { ...base, kind: 'windows-packaged-smoke-summary', direct: { evidenceCount: 1, evidenceKinds: ['packaged-vector-smoke'] }, evidence: [
       reference('packaged-vector-smoke', 'packaged-vector-smoke.json'),
-      reference('packaged-official-homepage-smoke', 'packaged-official-homepage-smoke.json'),
     ] },
     signing: { ...base, kind: 'windows-signing', direct: { authenticodeStatus: 'NotSigned', installerSha256: sha256(path.join(releaseRoot, `ai-novel-writer-setup-${releaseVersion}.exe`)) }, status: 'unsigned', validationResult: 'NotSigned', unsignedDistributionImpact: 'Windows may display an unknown-publisher warning.' },
   }
@@ -335,9 +334,6 @@ describe('release evidence v2 CLI', () => {
     writeFileSync(path.join(releaseRoot, 'latest.yml'), `version: ${version}\n`, 'utf8')
     writeJson(path.join(releaseRoot, 'qualification', 'packaged-vector-smoke.json'), {
       schemaVersion: 1, kind: 'packaged-vector-smoke', direct: { packaged: true },
-    })
-    writeJson(path.join(releaseRoot, 'qualification', 'packaged-official-homepage-smoke.json'), {
-      schemaVersion: 1, kind: 'packaged-official-homepage-smoke', direct: { packaged: true },
     })
     for (const receipt of [
       'install', 'launch', 'quiet-window', 'error-dialogs', 'uninstall', 'upgrade-data', 'native-abi', 'packaged-smoke',

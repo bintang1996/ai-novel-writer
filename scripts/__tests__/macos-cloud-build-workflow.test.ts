@@ -194,7 +194,7 @@ describe('macOS ARM64 cloud build workflow contract', () => {
     expect(smokeScript).toContain('hdiutil detach "$mount_point" -force -quiet')
     expect(smokeScript).toContain('rm -rf "$smoke_root" || true')
     expect(smokeScript).toContain('--ai-novel-release-smoke=')
-    expect(smokeScript).toContain('--ai-novel-release-homepage-smoke=')
+    expect(smokeScript).not.toMatch(/homepage-smoke/i)
     expect(smokeScript).not.toMatch(/skin/i)
     expect(smokeScript).toContain('AI_NOVEL_VELA_HOME')
     expect(smokeScript).toContain('security/darwin-safe-file-system')

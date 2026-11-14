@@ -106,19 +106,10 @@ describe('packaged vector qualification wiring', () => {
     expect(installer).toContain('RedirectStandardOutput')
   })
 
-  it('runs an offline dual-gated packaged official-homepage probe and preserves its JSON evidence', () => {
+  it('no longer runs a packaged official-homepage probe once the homepage feature is gone', () => {
     const installer = readFileSync(installerScript, 'utf8')
 
-    expect(installer).toContain('Invoke-AiNovelPackagedOfficialHomepageSmoke')
-    expect(installer).toContain("$env:AI_NOVEL_RELEASE_HOMEPAGE_SMOKE = '1'")
-    expect(installer).toContain('AI_NOVEL_RELEASE_HOMEPAGE_SMOKE_TOKEN')
-    expect(installer).toContain('--ai-novel-release-homepage-smoke=')
-    expect(installer).toContain('packaged-official-homepage-smoke.json')
-    expect(installer).toContain("$result.kind -eq 'packaged-official-homepage-smoke'")
-    expect(installer).toContain("$result.trustedIntent.url -eq 'https://github.com/EthanYoQ/AI-Novel-Writer'")
-    expect(installer).toContain('$result.trustedIntent.success -eq $true')
-    expect(installer).toContain('$result.failedOpenExternal.success -eq $false')
-    expect(installer).toContain('$result.failedOpenExternal.rendererError.enUS -eq \'Unable to open the official homepage. Please try again later.\'')
+    expect(installer).not.toMatch(/official-homepage|RELEASE_HOMEPAGE_SMOKE|PackagedOfficialHomepageSmoke/i)
   })
 
   it('no longer runs a packaged skin qualification once image skins are gone', () => {
@@ -143,8 +134,6 @@ describe('Windows PowerShell smoke script encoding', () => {
     expect(installer).toContain('function Get-AiNovelUtf8NonEmptyLines')
     expect(installer).toContain('[System.IO.File]::ReadAllBytes($Path)')
     expect(installer).toContain('[System.Text.UTF8Encoding]::new($false, $true)')
-    expect(installer).toContain("$result.failedOpenExternal.rendererError.zhCN -eq '无法打开官方主页，请稍后重试。'")
-    expect(installer).toContain('if ($evidenceSucceeded)')
   })
 })
 
@@ -166,7 +155,6 @@ describe('Windows v2 acceptance receipts', () => {
     expect(installer).toContain('enterprise policy')
     expect(installer).toContain('Assert-AiNovelUninstallPostcondition')
     expect(installer).toContain('packaged-vector-smoke.json')
-    expect(installer).toContain('packaged-official-homepage-smoke.json')
     expect(app).toContain('[string]$AcceptanceDirectory')
     expect(app).toContain('[string]$ExpectedVersion')
     expect(app).toContain("'launch.json'")
@@ -1481,7 +1469,7 @@ try {
 $probeRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('ai-novel-utf8-evidence-' + [guid]::NewGuid().ToString('N'))
 try {
   New-Item -ItemType Directory -Path $probeRoot -Force | Out-Null
-  $payload = '{"failedOpenExternal":{"rendererError":{"zhCN":"无法打开官方主页，请稍后重试。","enUS":"Unable to open the official homepage. Please try again later."}}}'
+  $payload = '{"product":{"zhCN":"AI小说搭子","enUS":"AINovelBuddy"}}'
   $withoutBom = Join-Path $probeRoot 'electron-no-bom.jsonl'
   $withBom = Join-Path $probeRoot 'electron-with-bom.jsonl'
   [System.IO.File]::WriteAllText($withoutBom, $payload, [System.Text.UTF8Encoding]::new($false))
@@ -1490,10 +1478,10 @@ try {
   $withBomEvidence = (Get-AiNovelUtf8NonEmptyLines -Path $withBom | Select-Object -Last 1 | ConvertFrom-Json)
   [pscustomobject]@{
     PowerShellMajor = $PSVersionTable.PSVersion.Major
-    NoBomZhCN = $withoutBomEvidence.failedOpenExternal.rendererError.zhCN
-    WithBomZhCN = $withBomEvidence.failedOpenExternal.rendererError.zhCN
-    NoBomEnUS = $withoutBomEvidence.failedOpenExternal.rendererError.enUS
-    WithBomEnUS = $withBomEvidence.failedOpenExternal.rendererError.enUS
+    NoBomZhCN = $withoutBomEvidence.product.zhCN
+    WithBomZhCN = $withBomEvidence.product.zhCN
+    NoBomEnUS = $withoutBomEvidence.product.enUS
+    WithBomEnUS = $withBomEvidence.product.enUS
   } | ConvertTo-Json -Compress
 } finally {
   Remove-Item -LiteralPath $probeRoot -Recurse -Force -ErrorAction SilentlyContinue
@@ -1502,10 +1490,10 @@ try {
     const result = parseLastJsonLine(output)
 
     expect(result.PowerShellMajor).toBeGreaterThanOrEqual(5)
-    expect(result.NoBomZhCN).toBe('无法打开官方主页，请稍后重试。')
-    expect(result.WithBomZhCN).toBe('无法打开官方主页，请稍后重试。')
-    expect(result.NoBomEnUS).toBe('Unable to open the official homepage. Please try again later.')
-    expect(result.WithBomEnUS).toBe('Unable to open the official homepage. Please try again later.')
+    expect(result.NoBomZhCN).toBe('AI小说搭子')
+    expect(result.WithBomZhCN).toBe('AI小说搭子')
+    expect(result.NoBomEnUS).toBe('AINovelBuddy')
+    expect(result.WithBomEnUS).toBe('AINovelBuddy')
   })
 
   windowsPowerShellIt('fails the release gate for every nonzero or abnormal job-contained descendant exit', () => {
