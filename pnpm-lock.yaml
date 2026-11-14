@@ -12,7 +12,6 @@ overrides:
   brace-expansion@2.0.3: 2.1.7
   brace-expansion@5.0.5: 5.0.12
   browserslist@4.28.2: 4.28.7
-  electron-updater@6.8.9>js-yaml: 4.3.2
   js-yaml@4.1.1: 4.3.2
   source-map-js@1.2.1: 1.2.2
   tar@7.5.13: 7.5.21
@@ -85,9 +84,6 @@ importers:
       diff-match-patch:
         specifier: ^1.0.5
         version: 1.0.5
-      electron-updater:
-        specifier: 6.8.9
-        version: 6.8.9
       flatbuffers:
         specifier: ^25.9.23
         version: 25.9.23
@@ -2597,9 +2593,6 @@ packages:
 
   electron-to-chromium@1.5.422:
     resolution: {integrity: sha512-UvA/32XqrLDdZSn7Jllo1AYNcWji/G0d5M0GTViE7KoGBiMunw3a34Sb2KO4ZZyrSEhqsxFoVhWWJshdyfKqJA==}
-
-  electron-updater@6.8.9:
-    resolution: {integrity: sha512-ZhVxM9iGONUpZGI1FxdMRgJjUFXi7AYGVa5PwKlO1tV1/4zDxQmfKpXOHVztKrd6L9rLcFjERvi1Mf2vxyTkig==}
 
   electron-winstaller@5.4.0:
     resolution: {integrity: sha512-bO3y10YikuUwUuDUQRM4KfwNkKhnpVO7IPdbsrejwN9/AABJzzTQ4GeHwyzNSrVO+tEH3/Np255a3sVZpZDjvg==}
@@ -7115,19 +7108,6 @@ snapshots:
       - supports-color
 
   electron-to-chromium@1.5.422: {}
-
-  electron-updater@6.8.9:
-    dependencies:
-      builder-util-runtime: 9.7.0
-      fs-extra: 10.1.0
-      js-yaml: 4.3.2
-      lazy-val: 1.0.5
-      lodash.escaperegexp: 4.1.2
-      lodash.isequal: 4.5.0
-      semver: 7.7.4
-      tiny-typed-emitter: 2.1.0
-    transitivePeerDependencies:
-      - supports-color
 
   electron-winstaller@5.4.0:
     dependencies:
